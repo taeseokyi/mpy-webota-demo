@@ -10,6 +10,8 @@
 #   GET    /hello                       무인증 — {webota, claimed, from_ap} (화면이 등록 필요를 안다)
 #   POST   /claim {"token"}             토큰이 없을 때만, 설정용 AP 로 붙은 기기에서만 — 기기 등록
 #   POST   /token {"token"}             토큰 바꾸기(지금 토큰 필요)
+#   POST   /login (폼: username, password)  토큰 확인 → 303 / — 브라우저 비밀번호 관리자가 저장·동기화
+#                                        하도록 **진짜 폼 제출 + 이동**을 준다(http 라 Credential API 불가)
 #
 #   GET    /status                      가동 시간·메모리·FS·앱 상태·마지막 배포 결과
 #   GET    /history[?n=10]              배포 결과 이력(라벨·ok|rolled_back·사유·시각)
@@ -50,7 +52,7 @@ import time
 
 import webota_boot as wb
 
-VERSION = "0.8.5"
+VERSION = "0.9.2"
 CONFIG = "/webota.json"
 DEFAULTS = {"port": 8266, "app": "app", "entry": "main", "wifi_file": None,
             "wifi_keys": ["ssid", "pass"], "wifi_timeout_s": 20, "confirm_s": 90,
@@ -326,7 +328,7 @@ def status():
           "last": wb.read_json(wb.DIR + "/last.json"),
           "deploy_id": _deploy_id, "confirm_s": cfg.get("confirm_s"),
           "app_id": cfg.get("app_id"), "current": _current(),
-          "modified": wb.read_json(wb.DIR + "/modified.json"),
+          "modified": _modified_now(),
           "installed": _inst_summary(), "prev": wb.exists(wb.DIR + "/prev"),
           "wifi": _wifi_status(),
           "keep": dict(zip(("settings", "data"), keep_lists()))}
@@ -575,7 +577,32 @@ def _mark_modified(path):
     paths = m.get("paths") or []
     if path not in paths:
         paths.append(path)
-    wb.write_json(wb.DIR + "/modified.json", {"paths": paths[-200:], "at": wb.stamp()})
+    _write_modified(paths)
+
+
+def _installed_files():
+    return set((wb.read_json(wb.DIR + "/installed.json") or {}).get("files") or [])
+
+
+def _modified_now():
+    """판 이탈의 **지금** 모습 — 기록된 경로 중 ①아직 있는 것(더했거나 고친 것) ②판에 있는데
+    사라진 것(지운 것)만 남긴다. 판에 없던 파일을 더했다가 지웠으면 이탈이 아니다(0.9.2: 정리로
+    지운 파일이 '수동 변경'에 계속 남던 문제)."""
+    m = wb.read_json(wb.DIR + "/modified.json")
+    if not m:
+        return None
+    inst = _installed_files()
+    paths = [x for x in m.get("paths") or [] if wb.exists(x) or x in inst]
+    if paths != (m.get("paths") or []):
+        _write_modified(paths)
+    return {"paths": paths, "at": m.get("at")} if paths else None
+
+
+def _write_modified(paths):
+    if paths:
+        wb.write_json(wb.DIR + "/modified.json", {"paths": paths[-200:], "at": wb.stamp()})
+    else:
+        wb.remove(wb.DIR + "/modified.json")
 
 
 def _save_config(c):
@@ -647,6 +674,7 @@ def _pkg(conn, method, rest, q, rf, clen):
                     os.remove(wb.p(n))
                     wb.prune_empty(n)
                     done.append(n)
+                    _modified_now()                     # 판에 없던 파일을 지웠다 — 이탈 기록에서 빠진다
                 except OSError:
                     refused.append(n)
             else:
@@ -871,11 +899,21 @@ class _Req:
 _req = None
 
 
+HEAD_TIMEOUT_S = 3        # 요청 첫 줄·헤더를 기다리는 시간
+
+
 def _handle(conn, peer=None):
     global _reset_pending, _req
-    conn.settimeout(30)
+    # ★요청 첫 줄·헤더는 짧게만 기다린다(0.9.1, 실기에서 발견): 크롬은 페이지를 옮길 때 **아무것도
+    #   보내지 않는 예비 연결**을 미리 연다. 한 번에 한 연결만 받는 이 서버가 그 빈 연결에서 30초를
+    #   기다리면 뒤의 진짜 요청이 밀리고, 시간 초과(OSError 116)가 500 으로 새 페이지에 섞였다.
+    #   아무것도 안 온 연결은 **응답 없이** 닫는다.
+    conn.settimeout(HEAD_TIMEOUT_S)
     rf = conn.makefile("rb")
-    parts = rf.readline().decode().split()
+    try:
+        parts = rf.readline().decode().split()
+    except OSError:
+        return                                   # 빈 예비 연결 — 조용히 닫는다
     if len(parts) < 2:
         return
     method, target = parts[0], parts[1]
@@ -896,9 +934,20 @@ def _handle(conn, peer=None):
                 clen = 0
         elif k == "x-token":
             token = v.strip()
+    conn.settimeout(30)                           # 본문(업로드)은 넉넉히
     rf = _req = _Req(rf, clen)                    # 이후 본문은 모두 이걸로 읽는다(남은 양을 안다)
     if raw_path in ("/", "/ui") and method == "GET":
         return _ui(conn)                           # 화면 자체는 비밀이 없다 — API 는 토큰
+    if raw_path == "/login" and method == "POST":
+        # ★크롬 비밀번호 관리자용(0.9.0): 설치 화면의 토큰 칸은 이 주소로 제출되는 진짜 로그인 폼이다.
+        #   크롬은 폼 제출 뒤 페이지가 바뀌는 것을 보고 '비밀번호를 저장할까요?' 를 띄우고, 구글 계정으로
+        #   다른 기기에 동기화한다(같은 주소에서 칸을 누르면 자동 입력). 여기서는 맞는지만 알려 준다.
+        form = _qs((_read_body(rf, clen, 4096) or b"").decode())
+        ok = bool(cfg.get("token")) and form.get("password", "") == cfg.get("token")
+        where = "/?login=ok" if ok else "/?login=bad"
+        _sendall(conn, ("HTTP/1.0 303 See Other\r\nLocation: %s\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n" % where).encode())
+        return
     if raw_path == "/hello" and method == "GET":
         import webota_net as net
         return _json(conn, {"webota": VERSION, "claimed": bool(cfg.get("token")),
