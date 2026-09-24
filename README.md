@@ -21,10 +21,13 @@ webota.example.json     기기 설정 /webota.json 예시
 ## 새 기기에 처음 설치 (USB 한 번)
 ```bash
 python3 tools/webota.py --host <기기IP> token          # ~/.config/webota/<기기IP>.token
-# webota.example.json 을 webota.json 으로 복사해 token · WiFi(wifi_file 또는 "wifi":{ssid,pass}) 를 채운다
+# webota.example.json 을 webota.json 으로 복사해 token 을 채운다(WiFi 는 비워 둬도 된다)
 mpremote fs cp webota/* src/app.py webota.json : + reset
+# 기기가 설정용 AP(webota-demo-setup / webota1234)를 올린다 — 휴대폰으로 붙어
+# http://192.168.4.1:8266/ 의 WiFi 카드에서 공유기를 고르고 저장(토큰 불필요)
 python3 tools/webota.py --host <기기IP> status
 ```
+앱(`src/app.py`)은 WiFi를 만지지 않습니다. 접속, 재접속, 설정용 AP는 webota가 맡고, 부팅 분기(`boot.py`, `main.py`)도 webota의 파일입니다.
 
 ## 판 올리기와 릴리스
 ```bash
