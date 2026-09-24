@@ -12,22 +12,24 @@ src/app.py              앱 — main() 이 진입점(런처가 부른다)
 webota/                 mpy-webota device/ 복사본(boot.py · main.py · webota*.py · webota_ui.html)
 tools/webota.py         mpy-webota 클라이언트 복사본
 webota.project.json     app_id · version · map(무엇을 기기 어디로) · data·settings(설치·정리가 건드리지 않는 곳)
-webota.example.json     기기 설정 /webota.json 예시
 ```
 
 ## 이미 mpy-webota가 설치된 기기에서
 설치 화면 `http://<기기>:8266/`에서 저장소 칸에 `taeseokyi/mpy-webota-demo`를 넣고 '더하기'를 누릅니다. 목록에서 판을 고르면, 다른 앱이 돌고 있던 기기라면 **'앱 교체'**가 뜹니다. 새 앱이 90초를 버티지 못하면 원래 앱으로 자동 롤백됩니다. 원래 앱으로 돌아가려면 그 앱의 저장소를 골라 다시 '앱 교체'를 누르면 됩니다.
 
 ## 새 기기에 처음 설치 (USB 한 번)
+USB로는 webota 파일만 올립니다. 기기 설정 `/webota.json`은 webota가 만듭니다.
 ```bash
-python3 tools/webota.py --host <기기IP> token          # ~/.config/webota/<기기IP>.token
-# webota.example.json 을 webota.json 으로 복사해 token 을 채운다(WiFi 는 비워 둬도 된다)
-mpremote fs cp webota/* src/app.py webota.json : + reset
-# 기기가 설정용 AP(webota-demo-setup / webota1234)를 올린다 — 휴대폰으로 붙어
-# http://192.168.4.1:8266/ 의 WiFi 카드에서 공유기를 고르고 저장(토큰 불필요)
-python3 tools/webota.py --host <기기IP> status
+mpremote fs cp webota/* : + reset
 ```
-앱(`src/app.py`)은 WiFi를 만지지 않습니다. 접속, 재접속, 설정용 AP는 webota가 맡고, 부팅 분기(`boot.py`, `main.py`)도 webota의 파일입니다.
+기기가 설정용 AP(`webota-XXXX` / `webota1234`)를 올립니다. 휴대폰으로 붙어 `http://192.168.4.1:8266/`에 들어가 다음을 합니다.
+1. **기기 등록**: '새로 만들기'를 누른 뒤 '등록'. 토큰을 PC의 `~/.config/webota/<기기IP>.token`에 적어 둡니다.
+2. **WiFi**: 공유기를 고르고 저장합니다.
+3. **패키지**: 저장소 칸에 `taeseokyi/mpy-webota-demo`를 더하고 판을 골라 설치합니다(첫 설치는 '앱 교체').
+
+미리 설정해서 구우려면 `python3 tools/webota.py device-config --out webota.json`으로 만들고 함께 올립니다. 재료는 이 저장소 `webota.project.json`의 `app_id`와 `device` 절, 그리고 토큰입니다. 이 경우 AP와 등록 단계를 건너뜁니다.
+
+앱(`src/app.py`)은 WiFi를 만지지 않습니다. 접속, 설정용 AP, 부팅 분기(`boot.py`, `main.py`)는 모두 webota가 맡습니다.
 
 ## 판 올리기와 릴리스
 ```bash
