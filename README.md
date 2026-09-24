@@ -11,7 +11,7 @@
 src/app.py              앱 — main() 이 진입점(런처가 부른다)
 webota/                 mpy-webota device/ 복사본(boot.py · main.py · webota*.py · webota_ui.html)
 tools/webota.py         mpy-webota 클라이언트 복사본
-webota.project.json     app_id · version · map(무엇을 기기 어디로)
+webota.project.json     app_id · version · map(무엇을 기기 어디로) · data·settings(설치·정리가 건드리지 않는 곳)
 webota.example.json     기기 설정 /webota.json 예시
 ```
 
