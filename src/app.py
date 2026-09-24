@@ -8,7 +8,7 @@ import socket
 import time
 import _thread
 
-VERSION = "0.6.0"
+VERSION = "1.0.0"
 LED_PIN = 2               # 보드마다 다르다 — 없으면 조용히 건너뛴다
 
 _t0 = time.time()

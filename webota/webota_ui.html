@@ -1,6 +1,14 @@
 <!doctype html>
 <html lang="ko">
 <head>
+<script>
+  // ★그리기 전에 판단한다(1.1.1): 크롬은 로그인 폼을 낸 뒤 **돌아온 페이지에 같은 비밀번호 칸이
+  //   보이면 로그인 실패로 보고 저장을 제안하지 않는다.** 토큰이 있거나 방금 맞았으면 칸을 숨긴다.
+  try {
+    if (/[?&]login=ok/.test(location.search) || localStorage.getItem("webota_token"))
+      document.documentElement.classList.add("authed");
+  } catch (e) {}
+</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>webota 설치</title>
@@ -52,6 +60,19 @@
   .msg:empty { display: none; }
   details { margin-top: 10px; color: var(--muted); font-size: .9rem; }
   .scroll { overflow-x: auto; }
+  .authed #tokForm { display: none; }
+  #tokHave { display: none; }
+  .authed #tokHave { display: flex; }
+  /* GitHub 확인(1.2.0) — 기기를 바꾸는 작업마다 */
+  #gh { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
+        justify-content: center; padding: 16px; z-index: 10; }
+  #gh[hidden] { display: none; }
+  #gh > div { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px;
+              width: 100%; max-width: 420px; }
+  #ghCode { font: 700 1.7rem/1.2 ui-monospace, Consolas, monospace; letter-spacing: .12em; text-align: center;
+            padding: 10px; margin: 10px 0; border-radius: 8px; background: var(--chip); user-select: all; }
+  a.btn { padding: 8px 14px; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600;
+          text-decoration: none; }
 </style>
 </head>
 <body>
@@ -64,7 +85,7 @@
          토큰을 비밀번호로 저장·동기화한다. 다른 기기에서는 토큰 칸을 누르면 자동 입력을 제안한다. -->
     <form id="tokForm" method="post" action="/login" autocomplete="on">
       <div class="row" style="margin-bottom:8px">
-        <input type="text" name="username" id="tokUser" autocomplete="username" readonly
+        <input type="text" name="username" id="tokUser" autocomplete="username"
                aria-label="기기(크롬에 저장될 이름)" style="color:var(--muted)">
       </div>
       <div class="row">
@@ -72,6 +93,10 @@
         <button type="submit" id="saveTok">저장</button>
       </div>
     </form>
+    <div class="row" id="tokHave" style="justify-content: space-between">
+      <span class="ok">✓ 토큰 저장됨(이 브라우저)</span>
+      <button type="button" class="ghost sm" id="tokChange">토큰 바꾸기</button>
+    </div>
     <div class="msg muted" id="tokMsg">'저장'하면 크롬이 토큰 저장을 제안합니다 — 저장해 두면 다른 기기의 크롬에서도 토큰 칸을 누르면 자동 입력됩니다(같은 주소에서).</div>
   </section>
 
@@ -117,16 +142,11 @@
     </div>
     <!-- ★출처 줄 정렬(0.5.3): 선택 상자는 한 줄을 다 쓰고, 보조 버튼은 그 아래 오른쪽에
          모은다 — 좁은 화면에서 버튼 하나만 다음 줄로 떨어지던 모양을 없앤다. -->
+    <!-- ★출처는 USB 로 정한 것만(1.0.0) — 여기서 더하거나 뺄 수 없다(좀비 설치 방지). 패키지는
+         USB 로 심은 공개키로 서명을 확인한 것만 설치된다. -->
     <div class="stack">
       <div class="row"><select id="src" aria-label="패키지 출처"></select></div>
-      <div class="row end">
-        <button class="ghost sm" id="srcDefault" title="이 저장소를 기본 출처로">기본으로</button>
-        <button class="ghost sm" id="srcRemove" title="목록에서 뺀다">빼기</button>
-      </div>
-      <div class="row">
-        <input type="text" id="srcAdd" placeholder="저장소 더하기 — owner/repo 또는 GitHub URL">
-        <button class="ghost sm" id="srcAddBtn">더하기</button>
-      </div>
+      <div class="muted" style="font-size:.82rem" id="secLine"></div>
     </div>
     <div class="msg muted" id="listMsg"></div>
     <div class="scroll"><table>
@@ -162,6 +182,17 @@
     </table></div>
   </section>
 </main>
+<div id="gh" hidden role="dialog" aria-modal="true" aria-labelledby="ghTitle"><div>
+  <h2 id="ghTitle">GitHub 확인</h2>
+  <div id="ghWhat" class="muted" style="font-size:.9rem"></div>
+  <div id="ghCode">····-····</div>
+  <div class="row end">
+    <button type="button" class="ghost sm" id="ghCopy">코드 복사</button>
+    <a class="btn" id="ghLink" href="https://github.com/login/device" target="_blank" rel="noopener">GitHub 열기</a>
+  </div>
+  <div class="msg" id="ghMsg">GitHub 에서 코드를 넣고 승인하면 저절로 이어집니다.</div>
+  <div class="row end" style="margin-top:10px"><button type="button" class="ghost sm" id="ghCancel">취소</button></div>
+</div></div>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
@@ -182,15 +213,51 @@ $("tokForm").onsubmit = () => {
   try { localStorage.setItem("webota_token", TOKEN); } catch (e) {}
   return true;                                   // 기본 제출을 막지 않는다 — 크롬이 봐야 한다
 };
+$("tokChange").onclick = () => {
+  document.documentElement.classList.remove("authed");
+  $("token").value = ""; $("token").focus();
+};
 (() => {
   const q = new URLSearchParams(location.search).get("login");
   if (!q) return;
   $("tokMsg").innerHTML = q === "ok"
     ? '<span class="ok">✓ 토큰이 맞습니다.</span> 크롬이 저장을 물으면 \'저장\'을 누르세요 — 다른 기기에서도 자동 입력됩니다.'
     : '<span class="bad">토큰이 틀립니다.</span>';
-  if (q !== "ok") { try { localStorage.removeItem("webota_token"); } catch (e) {} TOKEN = ""; $("token").value = ""; }
+  if (q !== "ok") {
+    try { localStorage.removeItem("webota_token"); } catch (e) {}
+    TOKEN = ""; $("token").value = "";
+    document.documentElement.classList.remove("authed");       // 틀렸으면 칸을 다시 보인다
+  }
   history.replaceState(null, "", "/");
 })();
+
+// ── GitHub 확인(1.2.0) — 기기를 바꾸는 작업(설치·정리·공유기 쪽 WiFi)마다 허용된 계정의 승인 ──
+let ghOwners = null, fromAp = false;
+const GH_WHAT = { install: "패키지 설치", clean: "남은 파일 지우기", wifi: "WiFi 변경" };
+// 승인이 필요 없는 기기면 null. 필요하면 창을 띄워 승인까지 기다린 뒤 auth_id — 취소·거부는 예외.
+async function ghAuth(action, body) {
+  if (!ghOwners || (action === "wifi" && fromAp)) return null;
+  const r = await api("/auth/start", { method: "POST", body: JSON.stringify({ action, body }) });
+  $("ghWhat").innerHTML = `<b>${esc(GH_WHAT[action] || action)}</b> — 허용 계정 <b>${esc(ghOwners.join(", "))}</b> 로 GitHub 에서 승인하세요. 이 승인은 이 작업 한 번에만 쓰입니다.`;
+  $("ghCode").textContent = r.user_code;
+  $("ghLink").href = r.verification_uri || "https://github.com/login/device";
+  $("ghMsg").textContent = "GitHub 에서 코드를 넣고 승인하면 저절로 이어집니다.";
+  $("gh").hidden = false;
+  let cancelled = false;
+  $("ghCancel").onclick = () => { cancelled = true; };
+  $("ghCopy").onclick = () => navigator.clipboard?.writeText(r.user_code).then(() => ($("ghMsg").textContent = "복사했습니다 — GitHub 에 붙여 넣으세요."), () => {});
+  try {
+    const end = Date.now() + (r.expires_in || 900) * 1000;
+    while (Date.now() < end) {
+      for (let t = 0; t < (r.interval || 5) * 10 && !cancelled; t++) await sleep(100);
+      if (cancelled) throw new Error("GitHub 확인을 취소했습니다");
+      const p = await api("/auth/poll", { method: "POST", body: JSON.stringify({ auth_id: r.auth_id }) }).catch((e) => e.data || { state: "pending" });
+      if (p.state === "approved") return r.auth_id;
+      if (p.state === "denied" || p.state === "expired") throw new Error("GitHub 확인 실패 — " + (p.err || p.state));
+    }
+    throw new Error("GitHub 확인 시간 초과");
+  } finally { $("gh").hidden = true; }
+}
 
 let current = null, appId = null, confirmS = 90;
 function renderStatus(st) {
@@ -209,6 +276,11 @@ function renderStatus(st) {
     ["보존", st.keep ? `<span class="muted">설정</span> ${esc(st.keep.settings.join(", "))}<br><span class="muted">데이터</span> ${esc(st.keep.data.filter((d) => d !== "/.webota").join(", "))}` : "—"],
     ["webota", esc(st.webota)],
   ];
+  const sec = st.security || {};
+  $("secLine").innerHTML = `서명 공개키 ${sec.pkg_keys?.length ? '<span class="ok">' + esc(sec.pkg_keys.join(", ")) + "</span>" : '<span class="bad">없음 — 설치 불가(USB 로 심는다)</span>'}`
+    + ` · 인증서 검증 ${sec.ca ? '<span class="ok">켜짐</span>' : '<span class="bad">CA 없음</span>'}`
+    + ` · GitHub 확인 ${sec.github_auth ? '<span class="ok">' + esc(sec.github_auth.join(", ")) + "</span>" : '<span class="muted">없음(기기 토큰만)</span>'}`;
+  ghOwners = sec.github_auth || null;
   if (st.app?.error) rows.push(["앱 오류", '<span class="bad">' + esc(st.app.error.trim().split("\n").pop()) + "</span>"]);
   $("dev").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
@@ -278,7 +350,9 @@ $("wSave").onclick = async () => {
   const ssid = $("wSsidManual").value.trim();
   if (!ssid) { $("wMsg").textContent = "공유기를 고르거나 SSID 를 입력하세요."; return; }
   try {
-    const r = await api("/wifi", { method: "POST", body: JSON.stringify({ ssid, pass: $("wPass").value }) });
+    const body = { ssid, pass: $("wPass").value };
+    body.auth_id = await ghAuth("wifi", body);
+    const r = await api("/wifi", { method: "POST", body: JSON.stringify(body) });
     $("wMsg").textContent = r.msg + " …";
     for (let i = 0; i < 20; i++) {
       await new Promise((ok) => setTimeout(ok, 2000));
@@ -299,34 +373,11 @@ async function loadSources() {
   const sel = $("src");
   sel.innerHTML = r.sources.length
     ? r.sources.map((k, i) => `<option value="${esc(k)}">${esc(k)}${i === 0 ? " (기본)" : ""}</option>`).join("")
-    : '<option value="">(출처 없음 — 저장소를 더하세요)</option>';
+    : '<option value="">(출처 없음 — USB 설치 때 정한다)</option>';
   if (srcKey && r.sources.includes(srcKey)) sel.value = srcKey;
   srcKey = sel.value || null;
 }
 $("src").onchange = () => { srcKey = $("src").value; loadPkgs(false); };
-$("srcAddBtn").onclick = async () => {
-  const v = $("srcAdd").value.trim();
-  if (!v) return;
-  try {
-    const r = await api("/pkg/sources", { method: "POST", body: JSON.stringify({ add: v }) });
-    $("srcAdd").value = "";
-    srcKey = r.sources[r.sources.length - 1];
-    await loadSources(); await loadPkgs(true);
-  } catch (e) { $("pkgMsg").innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
-};
-$("srcRemove").onclick = async () => {
-  if (!srcKey || !confirm(srcKey + " 을(를) 출처 목록에서 뺄까요?")) return;
-  await api("/pkg/sources", { method: "POST", body: JSON.stringify({ remove: srcKey }) });
-  srcKey = null; await loadSources(); await loadPkgs(false);
-};
-$("srcDefault").onclick = async () => {
-  if (!srcKey) return;
-  await api("/pkg/sources", { method: "POST", body: JSON.stringify({ default: srcKey }) });
-  await loadSources();
-};
-
-// ★목록 상태는 listMsg, 설치 진행은 pkgMsg — 설치 완료 뒤 목록을 다시 읽을 때 완료 문구를
-//   지우지 않게 칸을 나눈다(0.5.0 에서 앱 교체 완료 문구가 곧바로 사라졌다).
 async function loadPkgs(fresh) {
   $("listMsg").textContent = "목록을 가져오는 중…";
   try {
@@ -345,6 +396,7 @@ let justClaimed = false;                     // 방금 등록했으면 카드를
 async function loadHello() {
   try {
     const h = await (await fetch("/hello")).json();
+    fromAp = !!h.from_ap;
     $("tokUser").value = "webota · " + (h.app_id || "기기") + " @" + location.host;   // 크롬에 저장될 이름
     if (!justClaimed) $("claimCard").hidden = h.claimed;
     if (!h.claimed && !h.from_ap)
@@ -412,18 +464,25 @@ async function install(p, btn, switchApp) {
     if (otherApp(p)) { if (!confirm(SWITCH_WARN(appId, p.app_id) + "\n\n" + plan.text)) return; switchApp = true; }
     else if (!confirm(`${p.name || p.tag} 을(를) 설치합니다.\n\n${plan.text}\n\n기기가 내려받아 검증한 뒤 재부팅합니다. 계속할까요?`)) return;
   }
-  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  document.querySelectorAll("main button").forEach((b) => (b.disabled = true));
   const msg = $("pkgMsg");
+  const send = async (sw) => {                     // 작업 내용마다 새 승인(앱 교체로 바뀌면 다시)
+    const body = { url: p.url, src: srcKey, force: $("force").checked, switch_app: !!sw, ...resetOpts() };
+    msg.textContent = ghOwners ? "GitHub 확인을 기다리는 중…" : msg.textContent;
+    body.auth_id = await ghAuth("install", body);
+    msg.textContent = "기기가 패키지를 내려받는 중… (수십 초 걸릴 수 있습니다)";
+    return api("/pkg/install", { method: "POST", body: JSON.stringify(body) });
+  };
   msg.textContent = "기기가 패키지를 내려받는 중… (수십 초 걸릴 수 있습니다)";
   try {
     let r;
     try {
-      r = await api("/pkg/install", { method: "POST", body: JSON.stringify({ url: p.url, src: srcKey, force: $("force").checked, switch_app: !!switchApp, ...resetOpts() }) });
+      r = await send(switchApp);
     } catch (e) {
       if (e.data?.code !== "app_mismatch" || switchApp) throw e;
       if (!confirm(SWITCH_WARN(e.data.app_id, e.data.pkg_app_id))) { msg.textContent = "취소했습니다."; return; }
       msg.textContent = "앱 교체 — 기기가 다시 내려받는 중…";
-      r = await api("/pkg/install", { method: "POST", body: JSON.stringify({ url: p.url, src: srcKey, force: $("force").checked, switch_app: true, ...resetOpts() }) });
+      r = await send(true);
     }
     if (r.result === "unchanged") { msg.innerHTML = '<span class="ok">이미 이 판입니다 — 바뀐 파일이 없습니다.</span>'; return; }
     msg.textContent = `파일 ${r.files}개 변경 — 재부팅 후 새 판을 확인합니다…`;
@@ -431,7 +490,7 @@ async function install(p, btn, switchApp) {
   } catch (e) {
     msg.innerHTML = '<span class="bad">설치 실패: ' + esc(e.message) + "</span>";
   } finally {
-    document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    document.querySelectorAll("main button").forEach((b) => (b.disabled = false));
   }
 }
 
@@ -466,7 +525,9 @@ $("orphBtn").onclick = async () => {
     msg.textContent = "";
     $("orphDel").onclick = async () => {
       if (!confirm(`남은 파일 ${r.orphans.length}개를 지웁니다. 되돌릴 수 없습니다 — 계속할까요?`)) return;
-      const d = await api("/pkg/clean", { method: "POST", body: JSON.stringify({ paths: r.orphans.map((e) => e.path) }) }).catch((e) => e.data || { err: e.message });
+      const body = { paths: r.orphans.map((e) => e.path) };
+      const d = await ghAuth("clean", body).then((aid) => api("/pkg/clean", { method: "POST", body: JSON.stringify({ ...body, auth_id: aid }) }))
+        .catch((e) => e.data || { err: e.message });
       box.innerHTML = "";
       msg.innerHTML = d.deleted ? `<span class="ok">${d.deleted.length}개 지웠습니다.</span>` + (d.err ? ' <span class="bad">' + esc(d.err) + "</span>" : "")
                                 : '<span class="bad">' + esc(d.err) + "</span>";

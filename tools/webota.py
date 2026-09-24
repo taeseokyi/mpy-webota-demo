@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
-"""webota 클라이언트 — MicroPython 기기의 webota 서버(:8266)를 원격으로 다룬다.
+"""webota 클라이언트 — 1.0.0: 서명된 패키지 설치 · 수동 정리 · 서명/설정 도구.
 
-표준 라이브러리만 쓴다. CLI 로도, import 해서 라이브러리(`Client`)로도 쓴다.
+★원격으로 할 수 있는 것은 **서명된 패키지 설치와 정리**뿐이다(파일 API·원격 배포·리셋은 없앴다
+— 기기에 코드를 넣는 길은 USB 와 서명된 패키지 둘뿐이다). 표준 라이브러리 + openssl(서명).
 
-    webota.py status
-    webota.py ls /data -r
-    webota.py get /data/measure_kh.log            # 디렉토리면 재귀로 내려받는다
-    webota.py put local.py /app.py
-    webota.py rm '/data/*.bak'                    # ★따옴표: 글롭은 기기 쪽에서 푼다
-    webota.py mkdir /data/x ;  webota.py mv /a /b
-    webota.py reset
-    webota.py deploy [--delete] [--dry-run] [--label L]  # map 대로, 바뀐 파일만(라벨 기본: git describe)
-    webota.py history [-n 20]                     # 배포 결과 이력
-    webota.py pack --app-id ID --version V [--out dist/]   # map 대로 배포 패키지(.wpk) 만들기
-    webota.py pkg-list ;  webota.py pkg-install <URL>      # 기기가 직접 내려받아 설치
-    webota.py clean [-y]                          # 지금 판에 없는 남은 코드 파일 보여 주고 지우기
-    webota.py token                               # 새 토큰 생성(파일 저장)
-    webota.py device-config [--out webota.json]   # 프로젝트의 app_id·device 절 + 토큰 → 기기 설정 파일
-    webota.py claim                               # 토큰 없는 기기 등록(설정용 AP 에 붙은 PC 에서)
-    webota.py set-token --new-token-file F        # 등록된 기기의 토큰 바꾸기
+  기기 쪽(설치 화면과 같은 일):
+    webota.py status | history [-n 20] | sources | pkg-list [--fresh] [--src S]
+    webota.py pkg-install <URL> [--switch-app] [--reset-settings] [--reset-data]   # 계획을 먼저 보여 준다
+    webota.py clean [-y]
+  PC 쪽 도구:
+    webota.py signing-key init | show      # 패키지 서명 키(~/.config/webota/signing-key.pem)
+    webota.py pack --app-id ID --version V [--out dist/]      # map 대로 **서명된** 패키지(.wpk)
+    webota.py device-config [--out webota.json]   # 기기 설정 — app_id·device 절 + 토큰 + ★공개키 + GitHub 토큰
+    webota.py token | claim                   # 기기 토큰 만들기 · 토큰 없는 기기 등록(설정용 AP 에서)
+    webota.py signing-key publish             # 내 공개키를 프로젝트 파일에 — 커밋하면 누구나 내 패키지를 믿는 기기를 만든다
+    webota.py usb-install --port COMx         # ★USB 로 webota + 기기 설정만 올린다(앱은 기기 화면에서 설치)
 
 설정 찾는 순서:
   host  : --host  > $WEBOTA_HOST > 프로젝트 파일 "host"
   token : --token > $WEBOTA_TOKEN > --token-file > 프로젝트 "token_file" > ~/.config/webota/<host>.token
-  프로젝트 파일: 현재 디렉토리부터 위로 올라가며 찾는 `webota.project.json`
-    {"host": "192.168.0.47", "map": [{"src": "src/*.py", "dst": "/"},
-                                     {"src": "www/", "dst": "/www/"}], "exclude": ["*.pyc"]}
+  프로젝트 파일: 현재 디렉토리부터 위로 찾는 `webota.project.json`
 """
 import argparse
 import fnmatch
@@ -39,9 +33,11 @@ import sys
 import time
 import urllib.parse
 
-VERSION = "0.9.2"
+VERSION = "1.2.0"
 DEFAULT_PORT = 8266
 PROJECT_FILE = "webota.project.json"
+SIGNING_KEY = "~/.config/webota/signing-key.pem"       # 개인키 — 기기로 가지 않는다
+GITHUB_TOKEN_FILE = "~/.config/webota/github-device.token"   # 기기용 GitHub 토큰 — USB 로만 심는다
 # 잘못 바꾸면 원격으로 못 되돌리는 파일(USB 로만 복구) — 바꿀 때 한 번 더 묻는다.
 CRITICAL = ("/boot.py", "/main.py", "/webota.py", "/webota_boot.py", "/webota.json")
 
@@ -64,7 +60,161 @@ def token_path(host):
 
 # ── 배포 패키지(.wpk) — 형식은 device/webota_pkg.py 머리 참조 ──
 
-PKG_MAGIC = b"WPK1\n"
+PKG_MAGIC = b"WPK2\n"            # 서명 필수 형식(1.0.0~) — 머리 · 매니페스트 · 서명 · 파일
+PKG_MAGIC_V1 = b"WPK1\n"
+
+
+def _openssl(*args, data=None):
+    import subprocess
+    try:
+        return subprocess.run(["openssl", *args], input=data, capture_output=True, check=True).stdout
+    except FileNotFoundError:
+        raise WebotaError("openssl 이 없다 — 서명에 필요하다")
+    except subprocess.CalledProcessError as e:
+        raise WebotaError("openssl 실패: %s" % e.stderr.decode(errors="replace").strip())
+
+
+PASS_ENV = "WEBOTA_SIGN_PASS"          # 무인 빌드용(권하지 않는다) — 없으면 터미널에서 묻는다
+_pass_cache = {}
+
+
+def _read_secret(prompt):
+    """터미널에서 화면에 보이지 않게 한 줄 — ★바이트로 읽는다. getpass 는 UTF-8 로만 읽다가 한글
+    입력 상태나 다른 인코딩의 터미널에서 UnicodeDecodeError 로 죽었다(2026-09-25 실측).
+    ASCII 가 아니면 None(다시 묻게)."""
+    try:
+        import termios
+        with open("/dev/tty", "r+b", buffering=0) as tty:
+            tty.write(prompt.encode("utf-8"))
+            fd = tty.fileno()
+            old = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] &= ~termios.ECHO
+            try:
+                termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+                buf = b""
+                while True:
+                    ch = tty.read(1)
+                    if not ch or ch in (b"\n", b"\r"):
+                        break
+                    buf += ch
+            finally:
+                termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+                tty.write(b"\n")
+    except (ImportError, OSError):
+        import getpass                              # /dev/tty 가 없는 환경(윈도 등)
+        buf = getpass.getpass(prompt).encode("utf-8", "replace")
+    if any(b < 0x20 or b > 0x7e for b in buf):
+        return None
+    return buf.decode("ascii")
+
+
+def _askpass(path, confirm=False):
+    """서명 키 암호 — 환경변수가 있으면 그것, 아니면 터미널에서(getpass). confirm 이면 두 번 받아
+    같은지 확인한다. ★openssl 의 자체 입력에 맡기지 않는다: 1.1 은 확인이 틀려도 성공을 돌려줘
+    빈 키 파일을 남겼다(2026-09-25 실측)."""
+    if os.environ.get(PASS_ENV):
+        return os.environ[PASS_ENV]
+    if path in _pass_cache:
+        return _pass_cache[path]
+    while True:
+        pw = _read_secret("서명 키 암호(%s): " % os.path.basename(path))
+        if pw is None:
+            print("  ★영문·숫자·기호(ASCII)만 쓸 수 있습니다 — 한/영 키로 영문 입력 상태에서 다시 입력하세요.\n"
+                  "    (한글은 터미널마다 인코딩이 달라 같은 암호가 다른 바이트가 될 수 있다)", file=sys.stderr)
+            continue
+        if confirm:
+            if len(pw) < 8:
+                print("  8자 이상으로 하세요.", file=sys.stderr)
+                continue
+            again = _read_secret("한 번 더: ")
+            if again != pw:
+                print("  암호가 서로 다릅니다 — 다시 입력하세요.", file=sys.stderr)
+                continue
+        _pass_cache[path] = pw
+        return pw
+
+
+def _encrypted(path):
+    with open(path, "rb") as f:
+        return b"ENCRYPTED" in f.read(200)
+
+
+def _run_openssl(args, pw=None, data=None):
+    """openssl 실행 — 암호는 **환경변수로만** 넘긴다(명령줄·파일에 남지 않는다)."""
+    import subprocess
+    env = dict(os.environ)
+    if pw is not None:
+        env["WEBOTA_OPENSSL_PW"] = pw
+    try:
+        p = subprocess.run(["openssl"] + args, input=data, capture_output=True, env=env)
+    except FileNotFoundError:
+        raise WebotaError("openssl 이 없다 — 서명에 필요하다")
+    if p.returncode != 0:
+        raise WebotaError("openssl 실패: %s" % p.stderr.decode(errors="replace").strip().splitlines()[-1:])
+    return p.stdout
+
+
+def signing_key_init(path=SIGNING_KEY, overwrite=False, passphrase=True):
+    """서명 키를 만든다. ★기본은 암호를 거는 키(AES-256) — 서명할 때마다 암호를 묻는다. PC 가
+    오염돼도 키를 바로 쓸 수 없게(좀비 패키지가 서명을 통과하려면 이 키가 있어야 한다).
+    무인 빌드용으로만 passphrase=False(--no-passphrase). 만든 뒤 **읽혀지는지 확인**하고, 안 되면 지운다."""
+    path = os.path.expanduser(path)
+    if os.path.exists(path) and not overwrite:
+        raise WebotaError("이미 있다: %s (새로 만들면 기기의 공개키도 USB 로 다시 심어야 한다)" % path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    pw = _askpass(path, confirm=True) if passphrase else None
+    args = ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", path]
+    if pw is not None:
+        args += ["-aes-256-cbc", "-pass", "env:WEBOTA_OPENSSL_PW"]
+    try:
+        _run_openssl(args, pw)
+        os.chmod(path, 0o600)
+        _run_openssl(["pkey", "-in", path, "-noout"] + (["-passin", "env:WEBOTA_OPENSSL_PW"] if pw else []), pw)
+        rec = _pubkey_from_key(path)
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)                        # 망가진 키를 남기지 않는다
+        raise
+    with open(path + ".pub.json", "w") as f:       # 공개키는 따로 — device-config 가 암호 없이 읽는다
+        json.dump(rec, f)
+    return rec
+
+
+def pubkey_record(path=SIGNING_KEY):
+    """기기에 심을 공개키 {id, n, e} — 키 옆의 .pub.json 이 있으면 그것(암호 없이), 없으면 개인키에서."""
+    path = os.path.expanduser(path)
+    if os.path.exists(path + ".pub.json"):
+        with open(path + ".pub.json") as f:
+            return json.load(f)
+    if not os.path.exists(path):
+        raise WebotaError("서명 키가 없다: %s — webota.py signing-key init" % path)
+    return _pubkey_from_key(path)
+
+
+def _pubkey_from_key(path):
+    """개인키 → 공개키 {id, n, e}. id = 모듈러스 SHA256 앞 16자. 암호 걸린 키면 암호를 묻는다."""
+    pw = _askpass(path) if _encrypted(path) else None
+    out = _run_openssl(["rsa", "-in", path, "-noout", "-modulus"] +
+                       (["-passin", "env:WEBOTA_OPENSSL_PW"] if pw else []), pw)
+    n = out.decode().strip().split("=", 1)[1].lower()
+    return {"id": hashlib.sha256(bytes.fromhex(n)).hexdigest()[:16], "n": n, "e": 65537}
+
+
+def sign(data, path=SIGNING_KEY):
+    """매니페스트 서명 — 암호 걸린 키면 한 번 묻고(이 실행 동안 기억), openssl 에 환경변수로 넘긴다."""
+    import tempfile
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise WebotaError("서명 키가 없다: %s — webota.py signing-key init" % path)
+    pw = _askpass(path) if _encrypted(path) else None
+    with tempfile.NamedTemporaryFile(delete=False) as t:
+        t.write(data)
+    try:
+        return _run_openssl(["dgst", "-sha256", "-sign", path] +
+                            (["-passin", "env:WEBOTA_OPENSSL_PW"] if pw else []) + [t.name], pw)   # 파일은 맨 끝
+    finally:
+        os.remove(t.name)
 
 
 def _under(path, roots):
@@ -72,7 +222,8 @@ def _under(path, roots):
 
 
 def build_package(files, out_path, app_id, version, label=None, name=None, delete=(),
-                  webota_version=None, app="app", entry="main", settings=(), data=()):
+                  webota_version=None, app="app", entry="main", settings=(), data=(),
+                  sign_key=SIGNING_KEY):
     """files: {기기 경로: 로컬 경로} → .wpk. 매니페스트를 돌려준다. app·entry 는 앱 교체 때
     기기 런처가 부를 모듈·함수(기본 app.main). 파일 이름 규약: <app_id>-v<판>….wpk
     settings·data: 앱이 설정·데이터를 두는 경로(파일·디렉토리). 기기는 이 아래를 코드로 보지
@@ -81,7 +232,7 @@ def build_package(files, out_path, app_id, version, label=None, name=None, delet
     bad = [r for r in files if _under(r, data)]
     if bad:
         raise WebotaError("데이터 경로의 파일은 패키지에 넣지 않는다: " + ", ".join(bad))
-    man = {"format": 1, "app_id": app_id, "app": app, "entry": entry,
+    man = {"format": 2, "app_id": app_id, "app": app, "entry": entry,
            "settings": sorted(settings), "data": sorted(data),
            "name": name or app_id, "version": version,
            "label": label or ("v" + version), "built_at": time.strftime("%Y-%m-%d %H:%M"),
@@ -93,9 +244,10 @@ def build_package(files, out_path, app_id, version, label=None, name=None, delet
             e["kind"] = "setting"
         man["files"].append(e)
     mj = json.dumps(man, ensure_ascii=False).encode()
+    sig = sign(mj, sign_key)                # ★서명 없는 패키지는 기기가 받지 않는다
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "wb") as f:
-        f.write(PKG_MAGIC + str(len(mj)).encode() + b"\n" + mj)
+        f.write(PKG_MAGIC + str(len(mj)).encode() + b"\n" + mj + str(len(sig)).encode() + b"\n" + sig)
         for r in order:
             with open(files[r], "rb") as fi:
                 for b in iter(lambda: fi.read(65536), b""):
@@ -105,7 +257,8 @@ def build_package(files, out_path, app_id, version, label=None, name=None, delet
 
 def read_manifest(path):
     with open(path, "rb") as f:
-        if f.read(len(PKG_MAGIC)) != PKG_MAGIC:
+        magic = f.read(len(PKG_MAGIC))
+        if magic not in (PKG_MAGIC, PKG_MAGIC_V1):
             raise WebotaError("패키지가 아니다: " + path)
         n = int(f.readline())
         return json.loads(f.read(n))
@@ -160,28 +313,10 @@ class Client:
     def status(self, timeout=None):
         return self._req("GET", "/status", timeout=timeout)[1]
 
-    def ls(self, path="/", recursive=False, sha=False):
-        """디렉토리 목록(entries). path 가 파일이면 그 파일 하나의 항목."""
-        q = {}
-        if recursive:
-            q["r"] = "1"
-        if sha:
-            q["sha"] = "1"
-        parent = path.rstrip("/").rsplit("/", 1)[0] or "/"
-        _, obj = self._req("GET", "/fs" + path, q or None)
-        if isinstance(obj, dict) and "entries" in obj:
-            return obj["entries"]
-        # 파일이었다 — 부모 목록에서 그 항목을 찾아 돌려준다(본문은 버린다).
-        _, par = self._req("GET", "/fs" + parent, {"sha": "1"} if sha else None)
-        return [e for e in par["entries"] if e["path"] == path]
-
     def history(self, n=10):
         return self._req("GET", "/history", {"n": str(n)})[1]["history"]
 
-    def pkg_sources(self, add=None, remove=None, default=None):
-        if add or remove or default:
-            body = {"add": add} if add else {"remove": remove} if remove else {"default": default}
-            return self._req("POST", "/pkg/sources", body=body)[1]["sources"]
+    def pkg_sources(self):
         return self._req("GET", "/pkg/sources")[1]["sources"]
 
     def pkg_list(self, fresh=False, src=None):
@@ -198,14 +333,40 @@ class Client:
         return self._req("POST", "/pkg/plan", body={"url": url, "reset_settings": reset_settings,
                                                     "reset_data": reset_data}, timeout=120)[1]
 
+    # ── GitHub 확인(1.2.0) ──
+    def authorize(self, action, body, log=print, st=None, timeout=900):
+        """기기가 GitHub 확인을 요구하면(status.security.github_auth) 승인을 받아 auth_id 를 돌려준다
+        — 필요 없는 기기면 None. 화면에 https://github.com/login/device 와 확인 코드를 보여 주고,
+        사람이 GitHub 에서 승인할 때까지 기다린다. 승인은 이 작업(body) 한 번에만 쓰인다."""
+        st = st or self.status()
+        owners = (st.get("security") or {}).get("github_auth")
+        if not owners:
+            return None
+        r = self._req("POST", "/auth/start", body={"action": action, "body": body}, timeout=60)[1]
+        log("  ★GitHub 확인 — %s 에서 코드 %s 를 넣고 승인한다 (허용 계정: %s)"
+            % (r.get("verification_uri"), r.get("user_code"), ", ".join(owners)))
+        limit = time.time() + min(timeout, int(r.get("expires_in") or 900))
+        wait = max(1, int(r.get("interval") or 5))
+        while time.time() < limit:
+            time.sleep(wait)
+            p = self._req("POST", "/auth/poll", body={"auth_id": r["auth_id"]}, timeout=60)[1]
+            if p.get("state") == "approved":
+                log("  ✓ GitHub 승인 — %s" % p.get("login"))
+                return r["auth_id"]
+            if p.get("state") in ("denied", "expired"):
+                raise WebotaError("GitHub 확인 실패 — %s" % (p.get("err") or p.get("state")))
+        raise WebotaError("GitHub 확인 시간 초과")
+
     def pkg_install(self, url, force=False, wait=True, log=print, switch_app=False, src=None,
-                    reset_settings=False, reset_data=False):
+                    reset_settings=False, reset_data=False, auth_id=None):
         """기기가 url 의 패키지를 직접 내려받아 설치한다. 새 판 확인(또는 롤백)까지 기다린다.
-        다른 앱의 패키지는 switch_app=True 여야 한다(앱 교체)."""
+        다른 앱의 패키지는 switch_app=True 여야 한다(앱 교체). GitHub 확인이 설정된 기기면 먼저
+        승인을 받는다(auth_id 를 주면 그것을 쓴다)."""
         st0 = self.status()
-        r = self._req("POST", "/pkg/install", body={"url": url, "force": force, "src": src,
-                                                    "switch_app": switch_app, "reset_settings": reset_settings,
-                                                    "reset_data": reset_data}, timeout=300)[1]
+        body = {"url": url, "force": force, "src": src, "switch_app": switch_app,
+                "reset_settings": reset_settings, "reset_data": reset_data}
+        body["auth_id"] = auth_id or self.authorize("install", body, log, st0)
+        r = self._req("POST", "/pkg/install", body=body, timeout=300)[1]
         if r.get("result") == "unchanged":
             log("  이미 이 판이다(%s) — 바뀐 파일 없음" % r.get("label"))
             return "unchanged"
@@ -215,105 +376,10 @@ class Client:
     def orphans(self):
         return self._req("GET", "/pkg/orphans")[1]
 
-    def clean(self, paths):
-        return self._req("POST", "/pkg/clean", body={"paths": list(paths)})[1]
-
-    def sha(self, paths):
-        return self._req("POST", "/sha", body={"paths": list(paths)})[1]["sha"]
-
-    def get(self, remote, local):
-        """파일 하나 또는 디렉토리(재귀)를 내려받는다. 내려받은 로컬 경로 목록."""
-        _, obj = self._req("GET", "/fs" + remote)
-        if isinstance(obj, dict) and "entries" in obj:
-            out = []
-            for e in self.ls(remote, recursive=True):
-                if e["type"] != "f":
-                    continue
-                rel = e["path"][len(remote.rstrip("/")) + 1:]
-                dst = os.path.join(local, *rel.split("/"))
-                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-                self._req("GET", "/fs" + e["path"], stream_to=dst)
-                out.append(dst)
-            return out
-        if os.path.isdir(local):
-            local = os.path.join(local, remote.rsplit("/", 1)[-1])
-        os.makedirs(os.path.dirname(os.path.abspath(local)), exist_ok=True)
-        with open(local, "wb") as f:
-            f.write(obj if isinstance(obj, bytes) else json.dumps(obj).encode())
-        return [local]
-
-    # ── 변경 ──
-    def put(self, local, remote):
-        with open(local, "rb") as f:
-            return self._req("PUT", "/fs" + remote, {"sha": sha_of(local)}, body=f,
-                             length=os.path.getsize(local))[1]
-
-    def rm(self, remote, recursive=False):
-        return self._req("DELETE", "/fs" + remote, {"r": "1"} if recursive else None)[1]
-
-    def mkdir(self, remote):
-        return self._req("POST", "/fs" + remote, {"op": "mkdir"})[1]
-
-    def mv(self, src, dst):
-        return self._req("POST", "/fs" + src, {"op": "mv", "to": dst})[1]
-
-    def reset(self, force=False):
-        return self._req("POST", "/reset", {"force": "1"} if force else None)[1]
-
-    def expand(self, pattern):
-        """기기 쪽 글롭(* ? [)을 푼다 — 부모 디렉토리 목록에서 이름을 맞춘다."""
-        if not any(c in pattern for c in "*?["):
-            return [pattern]
-        parent, _, name = pattern.rstrip("/").rpartition("/")
-        return [e["path"] for e in self.ls(parent or "/")
-                if fnmatch.fnmatch(e["path"].rsplit("/", 1)[-1], name)]
-
-    # ── 배포 ──
-    def deploy(self, files, delete=(), force=False, reset=True, wait=True, dry_run=False,
-               log=print, label=None):
-        """files: {원격 경로: 로컬 경로}. 해시가 다른 파일만 올린다. label(예: 커밋)은 기기
-        이력(history)에 남는다 — 무엇이 언제 올라갔고 롤백됐는지 기기만 봐도 알 수 있게.
-        반환: {"id", "changed": [...], "delete": [...], "result"}. 롤백되면 WebotaError."""
-        remote_sha = self.sha(files.keys()) if files else {}
-        # 설정 파일은 기기에 이미 있으면 올리지 않는다(운영 중 바뀐 값을 지킨다 — 바꾸려면 put).
-        changed = [r for r, l in sorted(files.items()) if remote_sha.get(r) != sha_of(l)
-                   and not (_under(r, self.settings) and remote_sha.get(r) is not None)]
-        delete = sorted(delete)
-        res = {"id": None, "changed": changed, "delete": delete, "result": None}
-        if not changed and not delete:
-            log("  바뀐 파일 없음 — 배포할 것이 없다")
-            res["result"] = "unchanged"
-            return res
-        for r in changed:
-            log("  %s %s (%d B)" % ("+" if remote_sha.get(r) is None else "~", r,
-                                   os.path.getsize(files[r])))
-        for r in delete:
-            log("  - %s" % r)
-        if dry_run:
-            res["result"] = "dry-run"
-            return res
-        st0 = self.status()
-        did = self._req("POST", "/deploy/begin")[1]["id"]
-        res["id"] = did
-        items = []
-        for r in changed:
-            sha = sha_of(files[r])
-            with open(files[r], "rb") as f:
-                self._req("PUT", "/deploy/%s%s" % (did, r), {"sha": sha}, body=f,
-                          length=os.path.getsize(files[r]))
-            items.append({"path": r, "sha": sha})
-        self._req("POST", "/deploy/%s/commit" % did, {"force": "1"} if force else None,
-                  body={"files": items, "delete": delete, "reset": reset, "label": label,
-                        "all_files": sorted(files),          # 이 판을 이루는 파일 전체(정리 기준)
-                        "settings": list(self.settings), "data": list(self.data)})
-        log("  커밋 %s%s — 파일 %d개, 삭제 %d개%s" % (did, " [%s]" % label if label else "",
-                                                    len(items), len(delete),
-                                                 " · 리셋" if reset else " (다음 부팅에 적용)"))
-        if not (reset and wait):
-            res["result"] = "committed"
-            return res
-        res["result"] = self._wait(did, st0, log)
-        return res
+    def clean(self, paths, log=print, auth_id=None):
+        body = {"paths": list(paths)}
+        body["auth_id"] = auth_id or self.authorize("clean", body, log)
+        return self._req("POST", "/pkg/clean", body=body)[1]
 
     def _wait(self, did, st0, log):
         """리셋 → 새 판 시험 → 확인(ok) 또는 롤백까지 기다린다."""
@@ -394,22 +460,6 @@ def map_files(project):
     return files, scopes
 
 
-def extra_remote(client, files, scopes):
-    """map 범위 안에서 원격에만 있는 파일 — --delete 대상."""
-    extra = set()
-    for dst, pat in scopes:
-        d = dst.rstrip("/") or "/"
-        try:
-            ents = client.ls(d, recursive=pat is None)
-        except WebotaError:
-            continue
-        for e in ents:                           # 글롭 범위는 비재귀 목록이라 직계 파일뿐
-            if e["type"] == "f" and e["path"] not in files and (
-                    pat is None or fnmatch.fnmatch(e["path"].rsplit("/", 1)[-1], pat)):
-                extra.add(e["path"])
-    return sorted(extra)
-
-
 def git_label(root):
     """프로젝트의 git describe(태그 없으면 해시) — 없으면 None."""
     import subprocess
@@ -424,41 +474,132 @@ def git_label(root):
 DEVICE_DEFAULTS = {"port": DEFAULT_PORT, "app": "app", "entry": "main", "confirm_s": 90}
 
 
-def device_config(project, token):
+def device_config(project, token, pkg_keys=(), github_token=None, github_owners=None):
     """기기 설정(/webota.json) — webota 기본값 + 프로젝트의 app_id + "device" 절 + 토큰.
     ★webota.json 은 이 함수로만 만든다(앱 저장소에 생성 코드를 두지 않는다). 프로젝트 파일 예:
       {"app_id": "myapp", "device": {"ap": {"ssid": "myapp-setup", "pass": "..."},
-       "hostname": "myapp", "sources": [{"github": "owner/repo"}]}}"""
+       "hostname": "myapp", "sources": [{"github": "owner/repo"}],
+       "github_auth": {"client_id": "<OAuth App Client ID>", "owners": ["my-login"]}}}
+    github_auth(1.2.0): 기기를 바꾸는 작업마다 owners 중 한 계정의 GitHub 승인을 받는다.
+    github_owners 로 owners 를 바꾼다(빈 목록이면 GitHub 확인을 끈다)."""
     c = dict(DEVICE_DEFAULTS)
     if project.get("app_id"):
         c["app_id"] = project["app_id"]
     c.update(project.get("device") or {})
     c["token"] = token
+    if github_owners is not None:           # 내 기기 — 프로젝트 작성자 대신 내 GitHub 계정으로 승인
+        if not github_owners:
+            c.pop("github_auth", None)
+        elif not (c.get("github_auth") or {}).get("client_id"):
+            raise WebotaError("--github-owner 에는 프로젝트 파일 device.github_auth.client_id(OAuth App)가 필요하다")
+        else:
+            c["github_auth"] = dict(c["github_auth"], owners=list(github_owners))
+    c["pkg_keys"] = list(pkg_keys)          # ★USB 로만 — 이 공개키로 서명된 패키지만 설치된다
+    if github_token:
+        c["github_token"] = github_token    # ★USB 로만 — 어떤 웹 응답에도 나가지 않는다
     return c
+
+
+def project_keys(project, key_path=None):
+    """기기에 심을 공개키 목록 — ①--key 로 준 키 ②프로젝트 파일의 device.pkg_keys(저장소에 커밋된
+    **패키지 작성자의 공개키** — 다른 사람도 내 패키지를 믿는 기기를 만들 수 있다) ③내 서명 키.
+    ②가 있으면 개인키 없이도 된다(공개키는 공개해도 되는 정보다)."""
+    if key_path:
+        return [pubkey_record(key_path)]
+    keys = (project.get("device") or {}).get("pkg_keys")
+    if keys:
+        return list(keys)
+    return [pubkey_record(project.get("signing_key") or SIGNING_KEY)]
+
+
+DEVICE_FILES = ("webota.py", "webota_boot.py", "webota_pkg.py", "webota_net.py", "webota_sig.py", "webota_auth.py",
+                "webota_ca.pem", "webota_ui.html", "boot.py", "main.py")
+
+
+def device_dir(project):
+    """webota 기기 파일이 있는 곳 — 프로젝트 파일의 webota_device_dir(앱 저장소에 vendored 된 곳)
+    또는 mpy-webota 저장소의 device/."""
+    d = project.get("webota_device_dir")
+    if d:
+        return os.path.join(project.get("_root", "."), d)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "device")
+
+
+def mpremote_cmd():
+    import shutil
+    return ["mpremote"] if shutil.which("mpremote") else [sys.executable, "-m", "mpremote"]
+
+
+def usb_install(port, project, token, dry_run=False, reset=True, log=print, github_owners=None):
+    """USB 로 webota 와 기기 설정만 올린다 — 앱은 올리지 않는다(기기 화면에서 서명된 패키지로 설치 →
+    첫 설치가 그 앱을 받아들인다). 설정 파일은 임시로 만들어 올린 뒤 지운다(토큰이 들어 있다)."""
+    import subprocess
+    import tempfile
+    d = device_dir(project)
+    files = [os.path.join(d, n) for n in DEVICE_FILES]
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        raise WebotaError("webota 기기 파일이 없다: %s (webota_device_dir 확인)" % ", ".join(missing))
+    keys = project_keys(project)
+    cfg = device_config(project, token, keys, None, github_owners)
+    tmp = tempfile.mkdtemp(prefix="webota-usb-")
+    cpath = os.path.join(tmp, "webota.json")
+    try:
+        with open(cpath, "w") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        os.chmod(cpath, 0o600)
+        cmd = mpremote_cmd() + ["connect", port, "fs", "cp"] + files + [":", "+", "fs", "cp", cpath, ":webota.json"]
+        if reset:
+            cmd += ["+", "reset"]
+        log("  공개키 %s · 출처 %s · 앱 %s" % (", ".join(k["id"] for k in keys),
+                                          ", ".join(str(x) for x in cfg.get("sources") or []) or "-", cfg.get("app_id") or "-"))
+        log("  GitHub 확인: %s" % _ga_note(cfg))
+        log("$ " + " ".join(os.path.relpath(c) if os.path.exists(c) else c for c in cmd))
+        if dry_run:
+            return 0
+        return subprocess.call(cmd)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _ga_note(cfg):
+    ga = cfg.get("github_auth") or {}
+    if ga.get("client_id") and ga.get("owners"):
+        return "작업마다 승인 — " + ", ".join(ga["owners"])
+    return "없음(기기 토큰만으로 설치·정리된다)"
+
+
+def _owners_arg(a):
+    if getattr(a, "no_github_auth", False):
+        return []
+    return a.github_owner or None
+
+
+def publish_key(project_file, rec):
+    """내 공개키를 프로젝트 파일 device.pkg_keys 에 넣는다(같은 id 가 있으면 바꿈)."""
+    with open(project_file, encoding="utf-8") as f:
+        pj = json.load(f)
+    dev = pj.setdefault("device", {})
+    keys = [k for k in dev.get("pkg_keys") or [] if k.get("id") != rec["id"]]
+    dev["pkg_keys"] = keys + [rec]
+    with open(project_file, "w", encoding="utf-8") as f:
+        json.dump(pj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return dev["pkg_keys"]
 
 
 def ensure_token(tf):
     """토큰 파일이 없으면 만든다(랜덤 32자, 0600). 토큰을 돌려준다."""
     tf = os.path.expanduser(tf)
     if not os.path.exists(tf):
-        os.makedirs(os.path.dirname(tf), exist_ok=True)
+        os.makedirs(os.path.dirname(tf) or ".", exist_ok=True)
         with open(tf, "w") as f:
             f.write(secrets.token_hex(16) + "\n")
         os.chmod(tf, 0o600)
         print("새 토큰: %s" % tf, file=sys.stderr)
     with open(tf) as f:
         return f.read().strip()
-
-
-def _confirm_critical(paths, yes):
-    hit = [p for p in paths if p in CRITICAL]
-    if not hit or yes:
-        return True
-    print("★다음 파일은 잘못되면 원격으로 되돌릴 수 없다(USB 로만 복구): " + ", ".join(hit))
-    try:
-        return input("계속할까요? [y/N] ").strip().lower() == "y"
-    except EOFError:
-        return False
 
 
 def resolve(args, project):
@@ -486,141 +627,164 @@ def main(argv=None):
     ap.add_argument("--host")
     ap.add_argument("--token")
     ap.add_argument("--token-file")
-    ap.add_argument("-y", "--yes", action="store_true", help="중요 파일 변경 확인을 생략")
+    ap.add_argument("-y", "--yes", action="store_true", help="확인 질문을 생략")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    s = sub.add_parser("ls"); s.add_argument("path", nargs="?", default="/")
-    s.add_argument("-r", action="store_true"); s.add_argument("--sha", action="store_true")
-    s = sub.add_parser("get"); s.add_argument("remote"); s.add_argument("local", nargs="?", default=".")
-    s = sub.add_parser("put"); s.add_argument("local"); s.add_argument("remote")
-    s = sub.add_parser("rm"); s.add_argument("remote", nargs="+"); s.add_argument("-r", action="store_true")
-    s = sub.add_parser("mkdir"); s.add_argument("remote")
-    s = sub.add_parser("mv"); s.add_argument("src"); s.add_argument("dst")
-    s = sub.add_parser("reset"); s.add_argument("--force", action="store_true")
-    s = sub.add_parser("deploy")
-    s.add_argument("--delete", action="store_true", help="map 범위에서 원격에만 있는 파일 삭제")
-    s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--force", action="store_true", help="앱 가드(측정 중 등) 무시")
-    s.add_argument("--no-reset", action="store_true", help="커밋만 — 다음 부팅에 적용")
-    s.add_argument("--label", help="이력에 남길 라벨(기본: 프로젝트 git describe --always --dirty)")
     s = sub.add_parser("history"); s.add_argument("-n", type=int, default=10)
-    s = sub.add_parser("pack", help="map 대로 배포 패키지(.wpk)를 만든다")
-    s.add_argument("--app-id"); s.add_argument("--version"); s.add_argument("--label")
-    s.add_argument("--name"); s.add_argument("--out", default="dist")
+    sub.add_parser("sources", help="기기의 패키지 출처(USB 로 정한 것) — 보기만")
     s = sub.add_parser("pkg-list"); s.add_argument("--fresh", action="store_true"); s.add_argument("--src")
     s = sub.add_parser("pkg-install"); s.add_argument("url"); s.add_argument("--force", action="store_true")
     s.add_argument("--switch-app", action="store_true", help="다른 앱의 패키지로 기기를 교체"); s.add_argument("--src")
     s.add_argument("--reset-settings", action="store_true", help="선언된 설정을 패키지 기본값으로(토큰·WiFi 는 유지)")
     s.add_argument("--reset-data", action="store_true", help="★선언된 데이터를 모두 지운다")
-    sub.add_parser("clean", help="지금 판에 없는 남은 코드 파일을 보여 주고 지운다(데이터 제외)")
-    s = sub.add_parser("sources", help="기기의 패키지 출처(저장소) 목록 · 추가 · 삭제 · 기본")
-    s.add_argument("--add"); s.add_argument("--remove"); s.add_argument("--default")
-    s = sub.add_parser("device-config", help="기기 설정 파일(webota.json)을 만든다 — 프로젝트 app_id·device + 토큰")
-    s.add_argument("--out", default="webota.json")
+    s.add_argument("-y", "--yes", action="store_true", dest="yes_sub", help="확인 질문을 생략")
+    s = sub.add_parser("clean", help="지금 판에 없는 남은 코드 파일을 보여 주고 지운다(데이터 제외)")
+    s.add_argument("-y", "--yes", action="store_true", dest="yes_sub", help="확인 질문을 생략")
+    s = sub.add_parser("signing-key", help="패키지 서명 키 — init(만들기) · show(공개키 id) · publish(프로젝트 파일에)")
+    s.add_argument("action", choices=("init", "show", "publish")); s.add_argument("--key", default=SIGNING_KEY)
+    s.add_argument("--no-passphrase", action="store_true", help="암호 없는 키(무인 빌드용 — 권하지 않는다)")
+    s = sub.add_parser("pack", help="map 대로 서명된 배포 패키지(.wpk)를 만든다")
+    s.add_argument("--app-id"); s.add_argument("--version"); s.add_argument("--label")
+    s.add_argument("--name"); s.add_argument("--out", default="dist"); s.add_argument("--key", default=None)
+    s = sub.add_parser("device-config", help="기기 설정(webota.json) — app_id·device + 토큰 + 공개키 + GitHub 토큰")
+    s.add_argument("--out", default="webota.json"); s.add_argument("--key", default=None)
+    s.add_argument("--github-token-file", default=None)
+    s.add_argument("--github-owner", action="append", help="이 기기를 승인할 GitHub 계정(여러 번) — 프로젝트 파일의 owners 대신")
+    s.add_argument("--no-github-auth", action="store_true", help="GitHub 확인을 심지 않는다")
     sub.add_parser("claim", help="토큰 없는 기기에 토큰을 등록(설정용 AP 로 붙어서)")
-    s = sub.add_parser("set-token", help="등록된 기기의 토큰을 바꾼다(지금 토큰으로 인증)")
-    s.add_argument("--new-token-file", required=True)
-    s = sub.add_parser("token", help="새 토큰을 만들어 토큰 파일에 저장")
+    s = sub.add_parser("usb-install", help="USB 로 webota + 기기 설정(공개키·출처·내 토큰)만 올린다 — 앱은 기기 화면에서")
+    s.add_argument("--port", required=True); s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--no-reset", action="store_true")
+    s.add_argument("--github-owner", action="append", help="이 기기를 승인할 GitHub 계정(여러 번) — 프로젝트 파일의 owners 대신")
+    s.add_argument("--no-github-auth", action="store_true", help="GitHub 확인을 심지 않는다")
+    s = sub.add_parser("token", help="새 기기 토큰을 만들어 토큰 파일에 저장")
     s.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
+    a.yes = a.yes or getattr(a, "yes_sub", False)     # -y 는 명령 앞·뒤 어디에 써도 된다
     project = find_project()
 
-    if a.cmd == "token":
-        host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host")
-        tf = os.path.expanduser(a.token_file or project.get("token_file") or token_path(host or "default"))
-        if os.path.exists(tf) and not a.overwrite:
-            print("이미 있다: %s (--overwrite 로 새로)" % tf)
+    try:
+        if a.cmd == "signing-key":
+            if a.action == "publish":
+                pf = os.path.join(project.get("_root", "."), PROJECT_FILE)
+                if not project:
+                    raise WebotaError("프로젝트 파일(%s)이 없다 — 앱 저장소에서 실행한다" % PROJECT_FILE)
+                keys = publish_key(pf, pubkey_record(a.key))
+                print("%s 의 device.pkg_keys = %s — 커밋·푸시하면 누구나 이 공개키를 심은 기기를 만든다"
+                      % (pf, ", ".join(k["id"] for k in keys)))
+                return 0
+            rec = signing_key_init(a.key, passphrase=not a.no_passphrase) if a.action == "init" \
+                else pubkey_record(a.key)
+            print("서명 키 %s — 공개키 id %s (%d비트)" % (os.path.expanduser(a.key), rec["id"], len(rec["n"]) * 4))
             return 0
-        os.makedirs(os.path.dirname(tf), exist_ok=True)
-        with open(tf, "w") as f:
-            f.write(secrets.token_hex(16) + "\n")
-        os.chmod(tf, 0o600)
-        print("토큰 저장: %s" % tf)
-        return 0
-
-    if a.cmd == "pack":
-        files, _ = map_files(project)
-        app_id = a.app_id or project.get("app_id")
-        version = a.version or project.get("version")
-        if not files or not app_id or not version:
-            raise SystemExit("pack 에는 map · app_id · version 이 필요하다(인자 또는 %s)" % PROJECT_FILE)
-        label = a.label or git_label(project.get("_root", ".")) or ("v" + version)
-        out = os.path.join(a.out, "%s-%s.wpk" % (app_id, label))
-        man = build_package(files, out, app_id, version, label, a.name or project.get("name"),
-                            settings=project.get("settings") or [], data=project.get("data") or [])
-        print("%s — 파일 %d개, %d B" % (out, len(man["files"]), os.path.getsize(out)))
-        return 0
-
-    if a.cmd == "device-config":
-        host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host") or "default"
-        tok = a.token or ensure_token(a.token_file or project.get("token_file") or token_path(host))
-        with open(a.out, "w") as f:
-            json.dump(device_config(project, tok), f, ensure_ascii=False, indent=2)
-        os.chmod(a.out, 0o600)
-        print("기기 설정: %s" % a.out)
-        return 0
-    if a.cmd == "claim":
-        host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host") or "192.168.4.1"
-        tok = a.token or ensure_token(a.token_file or project.get("token_file") or token_path(host))
-        try:
+        if a.cmd == "token":
+            host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host")
+            tf = os.path.expanduser(a.token_file or project.get("token_file") or token_path(host or "default"))
+            if os.path.exists(tf) and not a.overwrite:
+                print("이미 있다: %s (--overwrite 로 새로)" % tf)
+                return 0
+            os.makedirs(os.path.dirname(tf) or ".", exist_ok=True)
+            with open(tf, "w") as f:
+                f.write(secrets.token_hex(16) + "\n")
+            os.chmod(tf, 0o600)
+            print("토큰 저장: %s" % tf)
+            return 0
+        if a.cmd == "pack":
+            files, _ = map_files(project)
+            app_id = a.app_id or project.get("app_id")
+            version = a.version or project.get("version")
+            if not files or not app_id or not version:
+                raise SystemExit("pack 에는 map · app_id · version 이 필요하다(인자 또는 %s)" % PROJECT_FILE)
+            label = a.label or git_label(project.get("_root", ".")) or ("v" + version)
+            out = os.path.join(a.out, "%s-%s.wpk" % (app_id, label))
+            man = build_package(files, out, app_id, version, label, a.name or project.get("name"),
+                                settings=project.get("settings") or [], data=project.get("data") or [],
+                                sign_key=a.key or project.get("signing_key") or SIGNING_KEY)
+            print("%s — 파일 %d개, %d B, 서명됨" % (out, len(man["files"]), os.path.getsize(out)))
+            return 0
+        if a.cmd == "device-config":
+            host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host") or "default"
+            tok = a.token or ensure_token(a.token_file or project.get("token_file") or token_path(host))
+            keys = project_keys(project, a.key)
+            gtf = os.path.expanduser(a.github_token_file or project.get("github_token_file") or GITHUB_TOKEN_FILE)
+            gtok = open(gtf).read().strip() if os.path.exists(gtf) else None
+            with open(a.out, "w") as f:
+                dc = device_config(project, tok, keys, gtok, _owners_arg(a))
+                json.dump(dc, f, ensure_ascii=False, indent=2)
+            os.chmod(a.out, 0o600)
+            print("기기 설정: %s — 공개키 %s · GitHub 토큰 %s · GitHub 확인 %s"
+                  % (a.out, ", ".join(k["id"] for k in keys), "있음" if gtok else "없음", _ga_note(dc)))
+            if gtok:
+                print("  ★GitHub 토큰은 기기의 모든 코드가 읽을 수 있다(MicroPython 에는 격리가 없다) — 공개 저장소라면"
+                      " 심지 말 것. 꼭 필요하면 읽기 전용·저장소 하나·짧은 만료로.", file=sys.stderr)
+            return 0
+        if a.cmd == "usb-install":
+            host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host") or "default"
+            tok = a.token or ensure_token(a.token_file or project.get("token_file") or token_path(host))
+            rc = usb_install(a.port, project, tok, dry_run=a.dry_run, reset=not a.no_reset,
+                             github_owners=_owners_arg(a))
+            if rc == 0 and not a.dry_run:
+                print("완료 — 기기가 부팅하면 설치 화면(http://<기기>:8266/)에서 판을 골라 설치한다.\n"
+                      "  이 기기의 토큰: %s (설치 화면 토큰 칸에 넣고 '저장' — 크롬에 저장된다)"
+                      % (a.token_file or project.get("token_file") or token_path(host)))
+            return rc
+        if a.cmd == "claim":
+            host = a.host or os.environ.get("WEBOTA_HOST") or project.get("host") or "192.168.4.1"
+            tok = a.token or ensure_token(a.token_file or project.get("token_file") or token_path(host))
             r = Client(host, "")._req("POST", "/claim", body={"token": tok})[1]
             print(r.get("msg"))
-        except WebotaError as e:
-            print("✗ %s" % e, file=sys.stderr)
-            return 1
-        return 0
+            return 0
+    except WebotaError as e:
+        print("✗ %s" % e, file=sys.stderr)
+        return 1
 
     host, token = resolve(a, project)
-    c = Client(host, token, settings=project.get("settings") or [], data=project.get("data") or [])
+    c = Client(host, token)
     try:
         if a.cmd == "status":
             print(json.dumps(c.status(), ensure_ascii=False, indent=2))
-        elif a.cmd == "ls":
-            for e in c.ls(a.path, recursive=a.r, sha=a.sha):
-                print("%s %s  %s%s" % (e["type"], _fmt_size(e.get("size")), e["path"],
-                                       ("  " + (e.get("sha") or "")) if a.sha else ""))
-        elif a.cmd == "get":
-            for p in c.get(a.remote, a.local):
-                print(p)
-        elif a.cmd == "put":
-            if not _confirm_critical([a.remote], a.yes):
-                return 1
-            r = c.put(a.local, a.remote)
-            print("%s  %s" % (r["path"], r["sha"]))
-        elif a.cmd == "rm":
-            paths = [p for pat in a.remote for p in c.expand(pat)]
-            if not paths:
-                print("맞는 파일 없음")
-                return 1
-            if not _confirm_critical(paths, a.yes):
-                return 1
-            for p in paths:
-                c.rm(p, recursive=a.r)
-                print("삭제 %s" % p)
-        elif a.cmd == "mkdir":
-            c.mkdir(a.remote)
-        elif a.cmd == "mv":
-            if not _confirm_critical([a.src, a.dst], a.yes):
-                return 1
-            c.mv(a.src, a.dst)
-        elif a.cmd == "reset":
-            c.reset(force=a.force)
-            print("리셋 요청됨")
-        elif a.cmd == "deploy":
-            files, scopes = map_files(project)
-            if not files:
-                raise SystemExit("map 에 맞는 로컬 파일이 없다(%s)" % PROJECT_FILE)
-            dels = extra_remote(c, files, scopes) if a.delete else []
-            crit = [r for r in files if r in CRITICAL]
-            rsha = c.sha(crit) if crit else {}
-            touched = [r for r in crit if rsha.get(r) != sha_of(files[r])] + dels
-            if not a.dry_run and not _confirm_critical(touched, a.yes):
-                return 1
-            c.deploy(files, dels, force=a.force, reset=not a.no_reset, dry_run=a.dry_run,
-                     label=a.label or git_label(project.get("_root", ".")))
-        elif a.cmd == "set-token":
-            new = ensure_token(a.new_token_file)
-            print(c._req("POST", "/token", body={"token": new})[1].get("msg"))
+        elif a.cmd == "history":
+            for e in c.history(a.n):
+                print("%s  %-11s %-24s %s%s" % (e.get("at", ""), e.get("result", ""),
+                                               e.get("label") or "-", e.get("id", ""),
+                                               ("  — " + e["reason"]) if e.get("reason") else ""))
+        elif a.cmd == "sources":
+            for i, k in enumerate(c.pkg_sources()):
+                print("%s %s" % ("*" if i == 0 else " ", k))
+        elif a.cmd == "pkg-list":
+            r = c.pkg_list(a.fresh, a.src)
+            if r.get("err"):
+                print("! " + r["err"])
+            cur = r.get("current") or ""
+            for p in r.get("packages") or []:
+                mark = "*" if cur == p.get("tag") or cur.startswith((p.get("tag") or "") + "+") else " "
+                other = p.get("app_id") and r.get("app_id") and p["app_id"] != r["app_id"]
+                print("%s %-22s %-18s %-17s %7s  %s" % (mark, p.get("name") or p.get("tag"),
+                                                        ("[다른 앱] " if other else "") + (p.get("app_id") or "?"),
+                                                        p.get("published", ""),
+                                                        "%dK" % ((p.get("size") or 0) // 1024), p.get("url")))
+        elif a.cmd == "pkg-install":
+            pl = c.pkg_plan(a.url, a.reset_settings, a.reset_data)
+            print("설치 계획 — %s (%s) · 서명 %s" % (pl.get("label"), pl.get("pkg_app_id"), pl.get("key")))
+            print("  쓸 파일 %d개 · 지울 파일 %d개%s" % (len(pl["write"]), len(pl["delete"]),
+                  "" if pl["declared"] else "  ★이 패키지는 설정·데이터를 선언하지 않았다 — webota 말고는 전부 정리 대상"))
+            if pl["reset_settings"] or pl["reset_data"]:
+                print("  ★초기화: %s — 파일 %d개" % (" · ".join(n for n, on in (("설정", pl["reset_settings"]),
+                      ("데이터", pl["reset_data"])) if on), len(pl["delete_reset"])))
+            for x in pl["delete"][:30]:
+                print("    - %s%s" % (x, "   ★초기화" if x in pl["delete_reset"] else
+                                       "   ★지금 설정·데이터" if x in pl["delete_kept_now"] else ""))
+            if len(pl["delete"]) > 30:
+                print("    … 외 %d개" % (len(pl["delete"]) - 30))
+            print("  보존: 설정 %s · 데이터 %s" % (", ".join(pl["keep_settings"]), ", ".join(pl["keep_data"])))
+            if (pl["delete"] or pl["delete_kept_now"]) and not a.yes:
+                try:
+                    if input("계속할까요? [y/N] ").strip().lower() != "y":
+                        return 1
+                except EOFError:
+                    return 1
+            c.pkg_install(a.url, force=a.force, switch_app=a.switch_app, src=a.src,
+                          reset_settings=a.reset_settings, reset_data=a.reset_data)
         elif a.cmd == "clean":
             r = c.orphans()
             if not r.get("ok"):
@@ -641,48 +805,6 @@ def main(argv=None):
                     return 1
             res = c.clean([e["path"] for e in o])
             print("삭제 %d개%s" % (len(res["deleted"]), (" · 거부 " + ", ".join(res["refused"])) if res["refused"] else ""))
-        elif a.cmd == "sources":
-            for i, k in enumerate(c.pkg_sources(a.add, a.remove, a.default)):
-                print("%s %s" % ("*" if i == 0 else " ", k))
-        elif a.cmd == "pkg-list":
-            r = c.pkg_list(a.fresh, a.src)
-            if r.get("err"):
-                print("! " + r["err"])
-            cur = r.get("current") or ""
-            for p in r.get("packages") or []:
-                mark = "*" if cur == p.get("tag") or cur.startswith((p.get("tag") or "") + "+") else " "
-                other = p.get("app_id") and r.get("app_id") and p["app_id"] != r["app_id"]
-                print("%s %-22s %-18s %-17s %7s  %s" % (mark, p.get("name") or p.get("tag"),
-                                                        ("[다른 앱] " if other else "") + (p.get("app_id") or "?"),
-                                                        p.get("published", ""),
-                                                        "%dK" % ((p.get("size") or 0) // 1024), p.get("url")))
-        elif a.cmd == "pkg-install":
-            pl = c.pkg_plan(a.url, a.reset_settings, a.reset_data)
-            print("설치 계획 — %s (%s)" % (pl.get("label"), pl.get("pkg_app_id")))
-            print("  쓸 파일 %d개 · 지울 파일 %d개%s" % (len(pl["write"]), len(pl["delete"]),
-                  "" if pl["declared"] else "  ★이 패키지는 설정·데이터를 선언하지 않았다 — webota 말고는 전부 정리 대상"))
-            if pl["reset_settings"] or pl["reset_data"]:
-                print("  ★초기화: %s — 파일 %d개" % (" · ".join(n for n, on in (("설정", pl["reset_settings"]),
-                      ("데이터", pl["reset_data"])) if on), len(pl["delete_reset"])))
-            for x in pl["delete"][:30]:
-                print("    - %s%s" % (x, "   ★초기화" if x in pl["delete_reset"] else
-                                       "   ★지금 설정·데이터" if x in pl["delete_kept_now"] else ""))
-            if len(pl["delete"]) > 30:
-                print("    … 외 %d개" % (len(pl["delete"]) - 30))
-            print("  보존: 설정 %s · 데이터 %s" % (", ".join(pl["keep_settings"]), ", ".join(pl["keep_data"])))
-            if (pl["delete"] or pl["delete_kept_now"]) and not a.yes:
-                try:
-                    if input("계속할까요? [y/N] ").strip().lower() != "y":
-                        return 1
-                except EOFError:
-                    return 1
-            c.pkg_install(a.url, force=a.force, switch_app=a.switch_app, src=a.src,
-                          reset_settings=a.reset_settings, reset_data=a.reset_data)
-        elif a.cmd == "history":
-            for e in c.history(a.n):
-                print("%s  %-11s %-24s %s%s" % (e.get("at", ""), e.get("result", ""),
-                                               e.get("label") or "-", e.get("id", ""),
-                                               ("  — " + e["reason"]) if e.get("reason") else ""))
     except WebotaError as e:
         print("✗ %s" % e, file=sys.stderr)
         return 1
