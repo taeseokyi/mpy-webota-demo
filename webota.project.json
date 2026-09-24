@@ -1,0 +1,9 @@
+{
+  "app_id": "webota-demo",
+  "version": "0.1.0",
+  "name": "mpy-webota demo",
+  "map": [
+    {"src": "src/*.py", "dst": "/"},
+    {"src": "webota/*", "dst": "/"}
+  ]
+}
